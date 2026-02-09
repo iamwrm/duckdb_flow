@@ -69,13 +69,17 @@ static Schema *gen_random_schema(Rng *rng, int ncols) {
     auto *s = static_cast<Schema *>(malloc(sizeof(Schema)));
     s->cols = static_cast<ColDef *>(calloc(ncols, sizeof(ColDef)));
     s->ncols = ncols;
-    s->cols[0] = {"row_id", COL_INT64, 0};
+    s->cols[0] = {"row_id", COL_INT64, 0, 0, 0};
     for (int c = 1; c < ncols; c++) {
         s->cols[c].name = col_pool[c];
-        s->cols[c].type = static_cast<ColType>(rng_range(rng, 0, 4));
+        s->cols[c].type = static_cast<ColType>(rng_range(rng, 0, 8));
         s->cols[c].varchar_cap =
             (s->cols[c].type == COL_VARCHAR)
                 ? static_cast<int>(rng_range(rng, 4, 200)) : 0;
+        if (s->cols[c].type == COL_DECIMAL) {
+            s->cols[c].decimal_width = static_cast<uint8_t>(rng_range(rng, 4, 18));
+            s->cols[c].decimal_scale = static_cast<uint8_t>(rng_range(rng, 0, s->cols[c].decimal_width));
+        }
     }
     return s;
 }
@@ -396,6 +400,81 @@ static void verify(const char *db_path, const char *table,
                             free(exp);
                             break;
                         }
+                        case COL_UINT32: {
+                            auto got = static_cast<uint32_t *>(
+                                duckdb_vector_get_data(vc))[r];
+                            auto exp = expected_uint32(seq, c);
+                            if (got != exp) {
+                                vr->cell_errors++;
+                                vr->ok = false;
+                                if (vr->cell_errors == 1)
+                                    snprintf(vr->first_err, sizeof(vr->first_err),
+                                        "u32 seq=%lld c=%d got=%u exp=%u",
+                                        (long long)seq, c, got, exp);
+                            }
+                            break;
+                        }
+                        case COL_UINT64: {
+                            auto got = static_cast<uint64_t *>(
+                                duckdb_vector_get_data(vc))[r];
+                            auto exp = expected_uint64(seq, c);
+                            if (got != exp) {
+                                vr->cell_errors++;
+                                vr->ok = false;
+                                if (vr->cell_errors == 1)
+                                    snprintf(vr->first_err, sizeof(vr->first_err),
+                                        "u64 seq=%lld c=%d", (long long)seq, c);
+                            }
+                            break;
+                        }
+                        case COL_FLOAT: {
+                            auto got = static_cast<float *>(
+                                duckdb_vector_get_data(vc))[r];
+                            auto exp = expected_float(seq, c);
+                            if (fabsf(got - exp) > 1e-4f) {
+                                vr->cell_errors++;
+                                vr->ok = false;
+                                if (vr->cell_errors == 1)
+                                    snprintf(vr->first_err, sizeof(vr->first_err),
+                                        "f32 seq=%lld c=%d", (long long)seq, c);
+                            }
+                            break;
+                        }
+                        case COL_DECIMAL: {
+                            /* DuckDB stores decimals as scaled integers.
+                               Read internal int, convert back to double. */
+                            uint8_t w = s->cols[c].decimal_width;
+                            uint8_t sc = s->cols[c].decimal_scale;
+                            double got_d;
+                            double scale_div = 1.0;
+                            for (uint8_t si = 0; si < sc; si++) scale_div *= 10.0;
+
+                            if (w <= 4) {
+                                int16_t iv = static_cast<int16_t *>(
+                                    duckdb_vector_get_data(vc))[r];
+                                got_d = (double)iv / scale_div;
+                            } else if (w <= 9) {
+                                int32_t iv = static_cast<int32_t *>(
+                                    duckdb_vector_get_data(vc))[r];
+                                got_d = (double)iv / scale_div;
+                            } else {
+                                int64_t iv = static_cast<int64_t *>(
+                                    duckdb_vector_get_data(vc))[r];
+                                got_d = (double)iv / scale_div;
+                            }
+                            double exp_d = expected_decimal(seq, c, w, sc);
+                            /* Allow tolerance for floating-point rounding */
+                            double tol = 1.0 / scale_div + 1e-9;
+                            if (fabs(got_d - exp_d) > tol) {
+                                vr->cell_errors++;
+                                vr->ok = false;
+                                if (vr->cell_errors == 1)
+                                    snprintf(vr->first_err, sizeof(vr->first_err),
+                                        "dec seq=%lld c=%d got=%.6f exp=%.6f",
+                                        (long long)seq, c, got_d, exp_d);
+                            }
+                            break;
+                        }
                     }
                 }
             }
@@ -643,9 +722,9 @@ int main() {
     // ── 6. Homogeneous type tables ─────────────────────────────────────
     printf("\n── 6. Homogeneous Type Tables ───────────────────────────────\n");
     {
-        ColType types[] = {COL_INT32, COL_INT64, COL_DOUBLE, COL_BOOL};
-        const char *tn[] = {"all_int32", "all_int64", "all_double", "all_bool"};
-        for (int t = 0; t < 4; t++) {
+        ColType types[] = {COL_INT32, COL_INT64, COL_DOUBLE, COL_BOOL, COL_UINT32, COL_UINT64, COL_FLOAT};
+        const char *tn[] = {"all_int32", "all_int64", "all_double", "all_bool", "all_uint32", "all_uint64", "all_float"};
+        for (int t = 0; t < 7; t++) {
             ColDef c[9];
             char ns[9][8];
             c[0] = {"row_id", COL_INT64, 0};

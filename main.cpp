@@ -336,6 +336,13 @@ int main() {
         {"account_id", COL_INT64,   0},
         {"fee",        COL_DOUBLE,  0},
     };
+    ColDef schema4_cols[] = {
+        {"counter",    COL_UINT32,  0,  0, 0},
+        {"big_id",     COL_UINT64,  0,  0, 0},
+        {"temp_f32",   COL_FLOAT,   0,  0, 0},
+        {"amount",     COL_DECIMAL, 0, 18, 6},
+        {"label",      COL_VARCHAR, 32, 0, 0},
+    };
 
     struct DemoCase {
         const char *label;
@@ -347,6 +354,7 @@ int main() {
         {"Schema 1: Simple",            {schema1_cols, 2}, 1000000},
         {"Schema 2: IoT Sensors",       {schema2_cols, 6}, 1000000},
         {"Schema 3: Financial Trades",  {schema3_cols, 8}, 1000000},
+        {"Schema 4: Extended Types",    {schema4_cols, 5}, 1000000},
     };
 
     for (auto &demo : demos) {

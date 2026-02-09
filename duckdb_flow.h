@@ -63,13 +63,19 @@ typedef enum ColType {
     COL_INT64   = 1,
     COL_DOUBLE  = 2,
     COL_BOOL    = 3,
-    COL_VARCHAR = 4
+    COL_VARCHAR = 4,
+    COL_UINT32  = 5,
+    COL_UINT64  = 6,
+    COL_FLOAT   = 7,
+    COL_DECIMAL = 8
 } ColType;
 
 typedef struct ColDef {
     const char *name;
     ColType     type;
-    int         varchar_cap;   /* only for COL_VARCHAR */
+    int         varchar_cap;    /* COL_VARCHAR: max string length */
+    uint8_t     decimal_width;  /* COL_DECIMAL: precision (1-38) */
+    uint8_t     decimal_scale;  /* COL_DECIMAL: digits after decimal point */
 } ColDef;
 
 /* Legacy/demo baseline used by tests. The implementation itself has no
@@ -88,6 +94,10 @@ static inline const char *coltype_sql_name(ColType t) {
         case COL_DOUBLE:  return "DOUBLE";
         case COL_BOOL:    return "BOOLEAN";
         case COL_VARCHAR: return "VARCHAR";
+        case COL_UINT32:  return "UINTEGER";
+        case COL_UINT64:  return "UBIGINT";
+        case COL_FLOAT:   return "FLOAT";
+        case COL_DECIMAL: return "DECIMAL";
     }
     return "VARCHAR";
 }
@@ -99,6 +109,10 @@ static inline const char *coltype_name(ColType t) {
         case COL_DOUBLE:  return "DOUBLE";
         case COL_BOOL:    return "BOOL";
         case COL_VARCHAR: return "VARCHAR";
+        case COL_UINT32:  return "UINT32";
+        case COL_UINT64:  return "UINT64";
+        case COL_FLOAT:   return "FLOAT";
+        case COL_DECIMAL: return "DECIMAL";
     }
     return "?";
 }
@@ -119,10 +133,23 @@ static inline bool schema_validate(const Schema *s, const char **err_msg) {
             case COL_INT64:
             case COL_DOUBLE:
             case COL_BOOL:
+            case COL_UINT32:
+            case COL_UINT64:
+            case COL_FLOAT:
                 break;
             case COL_VARCHAR:
                 if (col->varchar_cap < 2) {
                     if (err_msg) *err_msg = "varchar_cap must be >= 2";
+                    return false;
+                }
+                break;
+            case COL_DECIMAL:
+                if (col->decimal_width < 1 || col->decimal_width > 18) {
+                    if (err_msg) *err_msg = "decimal_width must be 1-18";
+                    return false;
+                }
+                if (col->decimal_scale > col->decimal_width) {
+                    if (err_msg) *err_msg = "decimal_scale must be <= decimal_width";
                     return false;
                 }
                 break;
@@ -141,6 +168,8 @@ static inline size_t schema_create_ddl_required(const Schema *s, const char *tab
         need += strlen(s->cols[i].name);
         need += 1;            /* space */
         need += strlen(coltype_sql_name(s->cols[i].type));
+        if (s->cols[i].type == COL_DECIMAL)
+            need += 10;       /* "(xx,yy)" with room to spare */
     }
     return need;
 }
@@ -158,9 +187,16 @@ static inline void schema_create_ddl(const Schema *s, const char *table,
     for (int i = 0; i < s->ncols; i++) {
         int rem = bufsz - off;
         if (rem <= 0) break;
-        int w = snprintf(buf + off, rem, "%s%s %s",
+        int w;
+        if (s->cols[i].type == COL_DECIMAL) {
+            w = snprintf(buf + off, rem, "%s%s DECIMAL(%d,%d)",
+                         i ? ", " : "", s->cols[i].name,
+                         s->cols[i].decimal_width, s->cols[i].decimal_scale);
+        } else {
+            w = snprintf(buf + off, rem, "%s%s %s",
                          i ? ", " : "", s->cols[i].name,
                          coltype_sql_name(s->cols[i].type));
+        }
         if (w < 0) {
             buf[bufsz - 1] = '\0';
             return;
@@ -200,6 +236,10 @@ static inline int col_storage_size(const ColDef *col) {
         case COL_DOUBLE:  return sizeof(double);
         case COL_BOOL:    return sizeof(int8_t);
         case COL_VARCHAR: return col->varchar_cap;
+        case COL_UINT32:  return sizeof(uint32_t);
+        case COL_UINT64:  return sizeof(uint64_t);
+        case COL_FLOAT:   return sizeof(float);
+        case COL_DECIMAL: return sizeof(double);
     }
     return 1;
 }
@@ -255,6 +295,18 @@ static inline void batch_set_varchar(Batch *b, int col, int row, const char *v) 
     strncpy(dst, v, b->col_stride[col] - 1);
     dst[b->col_stride[col] - 1] = '\0';
 }
+static inline void batch_set_uint32(Batch *b, int col, int row, uint32_t v) {
+    ((uint32_t *)b->col_data[col])[row] = v;
+}
+static inline void batch_set_uint64(Batch *b, int col, int row, uint64_t v) {
+    ((uint64_t *)b->col_data[col])[row] = v;
+}
+static inline void batch_set_float(Batch *b, int col, int row, float v) {
+    ((float *)b->col_data[col])[row] = v;
+}
+static inline void batch_set_decimal(Batch *b, int col, int row, double v) {
+    ((double *)b->col_data[col])[row] = v;
+}
 
 /* ── Getters ─────────────────────────────────────────────────────────── */
 
@@ -275,6 +327,18 @@ static inline const char *batch_get_varchar(const Batch *b, int col, int row) {
 }
 static inline char *batch_get_varchar_mut(Batch *b, int col, int row) {
     return (char *)b->col_data[col] + row * b->col_stride[col];
+}
+static inline uint32_t batch_get_uint32(const Batch *b, int col, int row) {
+    return ((uint32_t *)b->col_data[col])[row];
+}
+static inline uint64_t batch_get_uint64(const Batch *b, int col, int row) {
+    return ((uint64_t *)b->col_data[col])[row];
+}
+static inline float batch_get_float(const Batch *b, int col, int row) {
+    return ((float *)b->col_data[col])[row];
+}
+static inline double batch_get_decimal(const Batch *b, int col, int row) {
+    return ((double *)b->col_data[col])[row];
 }
 
 /* ============================================================================
@@ -335,6 +399,8 @@ static inline bool schema_clone(const Schema *src, Schema *dst) {
     for (int i = 0; i < src->ncols; i++) {
         dst->cols[i].type = src->cols[i].type;
         dst->cols[i].varchar_cap = src->cols[i].varchar_cap;
+        dst->cols[i].decimal_width = src->cols[i].decimal_width;
+        dst->cols[i].decimal_scale = src->cols[i].decimal_scale;
         dst->cols[i].name = dup_cstr(src->cols[i].name);
         if (!dst->cols[i].name) {
             schema_destroy_copy(dst);
@@ -430,6 +496,14 @@ static inline duckdb_state append_batch_cell(const Batch *b, const Schema *s,
             return duckdb_append_bool(appender, batch_get_bool(b, c, row));
         case COL_VARCHAR:
             return duckdb_append_varchar(appender, batch_get_varchar(b, c, row));
+        case COL_UINT32:
+            return duckdb_append_uint32(appender, batch_get_uint32(b, c, row));
+        case COL_UINT64:
+            return duckdb_append_uint64(appender, batch_get_uint64(b, c, row));
+        case COL_FLOAT:
+            return duckdb_append_float(appender, batch_get_float(b, c, row));
+        case COL_DECIMAL:
+            return duckdb_append_double(appender, batch_get_decimal(b, c, row));
     }
     return DuckDBError;
 }
@@ -476,6 +550,38 @@ static inline void expected_varchar(int64_t seq, int col, int cap, char *buf) {
              (unsigned long long)(seq * 37 + col));
 }
 
+static inline uint32_t expected_uint32(int64_t seq, int col) {
+    return (uint32_t)((seq * 31 + col * 7) ^ 0xBEEF);
+}
+
+static inline uint64_t expected_uint64(int64_t seq, int col) {
+    return (uint64_t)((seq * 1000003ULL + col * 999983ULL) ^ 0xFACEULL);
+}
+
+static inline float expected_float(int64_t seq, int col) {
+    return (float)(seq % 10000) * 0.01f + col * 1.1f;
+}
+
+static inline double expected_decimal(int64_t seq, int col, uint8_t width,
+                                      uint8_t scale) {
+    /* Generate a deterministic value that fits in DECIMAL(width, scale).
+       Integer part has (width - scale) digits, fractional part has scale digits. */
+    int64_t int_digits = width - scale;
+    int64_t int_max = 1;
+    for (uint8_t i = 0; i < int_digits && i < 15; i++) int_max *= 10;
+    int_max--;
+    int64_t int_part = (int64_t)((seq * 31 + col * 7) % (int_max + 1));
+
+    double frac = 0.0;
+    if (scale > 0) {
+        int64_t frac_max = 1;
+        for (uint8_t i = 0; i < scale && i < 15; i++) frac_max *= 10;
+        int64_t frac_part = (int64_t)((seq * 13 + col * 3) % frac_max);
+        frac = (double)frac_part / (double)frac_max;
+    }
+    return (double)int_part + frac;
+}
+
 static inline void fill_row_deterministic(Batch *b, int row, int64_t seq,
                                           const Schema *s) {
     for (int c = 0; c < s->ncols; c++) {
@@ -495,6 +601,20 @@ static inline void fill_row_deterministic(Batch *b, int row, int64_t seq,
             case COL_VARCHAR:
                 expected_varchar(seq, c, s->cols[c].varchar_cap,
                                  batch_get_varchar_mut(b, c, row));
+                break;
+            case COL_UINT32:
+                batch_set_uint32(b, c, row, expected_uint32(seq, c));
+                break;
+            case COL_UINT64:
+                batch_set_uint64(b, c, row, expected_uint64(seq, c));
+                break;
+            case COL_FLOAT:
+                batch_set_float(b, c, row, expected_float(seq, c));
+                break;
+            case COL_DECIMAL:
+                batch_set_decimal(b, c, row,
+                                 expected_decimal(seq, c, s->cols[c].decimal_width,
+                                                  s->cols[c].decimal_scale));
                 break;
         }
     }

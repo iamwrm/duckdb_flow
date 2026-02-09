@@ -21,9 +21,15 @@ Producer (hot thread)         Consumer (background thread)
 |------|--------|-------------|
 | `COL_INT32` | `int32_t` | `INTEGER` |
 | `COL_INT64` | `int64_t` | `BIGINT` |
+| `COL_UINT32` | `uint32_t` | `UINTEGER` |
+| `COL_UINT64` | `uint64_t` | `UBIGINT` |
+| `COL_FLOAT` | `float` | `FLOAT` |
 | `COL_DOUBLE` | `double` | `DOUBLE` |
+| `COL_DECIMAL` | `double` | `DECIMAL(w,s)` |
 | `COL_BOOL` | `int8_t` | `BOOLEAN` |
 | `COL_VARCHAR` | fixed-capacity `char[]` | `VARCHAR` |
+
+For `COL_DECIMAL`, set `decimal_width` (1-18) and `decimal_scale` in `ColDef`.
 
 ## Building
 
