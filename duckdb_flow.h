@@ -1,6 +1,6 @@
 #pragma once
 // ============================================================================
-// doublebuf.h — Schema-generic double-buffered appender for DuckDB
+// duckdb_flow.h — Schema-generic double-buffered appender for DuckDB
 //
 // Hot-thread-safe column-oriented batching with lock-free ping-pong handoff.
 // The producer (hot thread) never touches DuckDB; the consumer (background

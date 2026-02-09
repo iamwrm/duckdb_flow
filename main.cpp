@@ -6,7 +6,7 @@
 // cell values.
 // ============================================================================
 
-#include "doublebuf.h"
+#include "duckdb_flow.h"
 
 #include <pthread.h>
 #include <unistd.h>

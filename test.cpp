@@ -1,5 +1,5 @@
 // ============================================================================
-// test.cpp — Fuzz test suite for doublebuf.h
+// test.cpp — Fuzz test suite for duckdb_flow.h
 //
 // 9 test suites, 164 tests, 32M+ cells verified:
 //   1. Boundary row counts
@@ -13,7 +13,7 @@
 //   9. Adversarial patterns (primes, powers of 2)
 // ============================================================================
 
-#include "doublebuf.h"
+#include "duckdb_flow.h"
 
 #include <pthread.h>
 #include <unistd.h>
