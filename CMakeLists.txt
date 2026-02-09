@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.14)
 project(duckdb_flow LANGUAGES CXX C)
 
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
@@ -101,3 +102,7 @@ target_compile_options(main PRIVATE ${COMMON_COMPILE_FLAGS})
 add_executable(test_fuzz test.cpp)
 target_link_libraries(test_fuzz PRIVATE ${COMMON_LIBS})
 target_compile_options(test_fuzz PRIVATE ${COMMON_COMPILE_FLAGS})
+
+# C11 compilation check — catches C++ syntax leaking back into the header
+add_library(c11_check OBJECT c11_check.c)
+target_link_libraries(c11_check PRIVATE duckdb_flow duckdb)

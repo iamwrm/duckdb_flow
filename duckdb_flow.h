@@ -1,27 +1,52 @@
 #pragma once
-// ============================================================================
-// duckdb_flow.h — Schema-generic double-buffered appender for DuckDB
-//
-// Hot-thread-safe column-oriented batching with lock-free ping-pong handoff.
-// The producer (hot thread) never touches DuckDB; the consumer (background
-// thread) drains batches through the DuckDB C appender API.
-//
-// Usage:
-//   1. Define a Schema (array of ColDef)
-//   2. Create a DoubleBuf
-//   3. Producer fills rows via batch_set_* and publishes with publish_batch()
-//   4. Consumer drains via drain_batch_to_appender()
-//   5. Shutdown: producer sends a batch with is_final=1
-// ============================================================================
+/* ============================================================================
+   duckdb_flow.h — Schema-generic double-buffered appender for DuckDB
 
-#include <cstdint>
-#include <cstdlib>
-#include <cstring>
-#include <cstdio>
-#include <cmath>
-#include <atomic>
-#include <thread>
-#include <new>
+   Hot-thread-safe column-oriented batching with lock-free ping-pong handoff.
+   The producer (hot thread) never touches DuckDB; the consumer (background
+   thread) drains batches through the DuckDB C appender API.
+
+   Compiles as both C11 and C++17.
+
+   Usage:
+     1. Define a Schema (array of ColDef)
+     2. Create a DoubleBuf
+     3. Producer fills rows via batch_set_* and publishes with publish_batch()
+     4. Consumer drains via drain_batch_to_appender()
+     5. Shutdown: producer sends a batch with is_final=1
+   ========================================================================= */
+
+#ifdef __cplusplus
+  #include <cstdint>
+  #include <cstdlib>
+  #include <cstring>
+  #include <cstdio>
+  #include <cmath>
+  #include <atomic>
+  #include <thread>
+  #define DFLOW_ATOMIC(T)        std::atomic<T>
+  #define DFLOW_ALOAD(x, o)      (x).load(o)
+  #define DFLOW_ASTORE(x, v, o)  (x).store((v), (o))
+  #define DFLOW_ACQ              std::memory_order_acquire
+  #define DFLOW_REL              std::memory_order_release
+  #define DFLOW_NULL             nullptr
+#else
+  #include <stdint.h>
+  #include <stdlib.h>
+  #include <string.h>
+  #include <stdio.h>
+  #include <math.h>
+  #include <stdatomic.h>
+  #include <stdbool.h>
+  #include <stdalign.h>
+  #include <sched.h>
+  #define DFLOW_ATOMIC(T)        _Atomic(T)
+  #define DFLOW_ALOAD(x, o)      atomic_load_explicit(&(x), (o))
+  #define DFLOW_ASTORE(x, v, o)  atomic_store_explicit(&(x), (v), (o))
+  #define DFLOW_ACQ              memory_order_acquire
+  #define DFLOW_REL              memory_order_release
+  #define DFLOW_NULL             NULL
+#endif
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 #include <immintrin.h>
@@ -29,34 +54,34 @@
 
 #include "duckdb.h"
 
-// ============================================================================
-// Schema Definition
-// ============================================================================
+/* ============================================================================
+   Schema Definition
+   ========================================================================= */
 
-enum ColType : int {
+typedef enum ColType {
     COL_INT32   = 0,
     COL_INT64   = 1,
     COL_DOUBLE  = 2,
     COL_BOOL    = 3,
-    COL_VARCHAR = 4,
-};
+    COL_VARCHAR = 4
+} ColType;
 
-struct ColDef {
+typedef struct ColDef {
     const char *name;
     ColType     type;
-    int         varchar_cap;   // only for COL_VARCHAR
-};
+    int         varchar_cap;   /* only for COL_VARCHAR */
+} ColDef;
 
-// Legacy/demo baseline used by tests. The implementation itself has no
-// internal hard cap on schema columns.
-static constexpr int MAX_COLS = 32;
+/* Legacy/demo baseline used by tests. The implementation itself has no
+   internal hard cap on schema columns. */
+enum { MAX_COLS = 32 };
 
-struct Schema {
+typedef struct Schema {
     ColDef *cols;
     int     ncols;
-};
+} Schema;
 
-inline const char *coltype_sql_name(ColType t) {
+static inline const char *coltype_sql_name(ColType t) {
     switch (t) {
         case COL_INT32:   return "INTEGER";
         case COL_INT64:   return "BIGINT";
@@ -67,7 +92,7 @@ inline const char *coltype_sql_name(ColType t) {
     return "VARCHAR";
 }
 
-inline const char *coltype_name(ColType t) {
+static inline const char *coltype_name(ColType t) {
     switch (t) {
         case COL_INT32:   return "INT32";
         case COL_INT64:   return "INT64";
@@ -78,51 +103,50 @@ inline const char *coltype_name(ColType t) {
     return "?";
 }
 
-inline bool schema_validate(const Schema *s, const char **err_msg = nullptr) {
-    auto fail = [&](const char *msg) -> bool {
-        if (err_msg) *err_msg = msg;
-        return false;
-    };
-
-    if (!s) return fail("schema is null");
-    if (!s->cols) return fail("schema columns are null");
-    if (s->ncols <= 0) return fail("schema must have at least one column");
+static inline bool schema_validate(const Schema *s, const char **err_msg) {
+    if (!s) { if (err_msg) *err_msg = "schema is null"; return false; }
+    if (!s->cols) { if (err_msg) *err_msg = "schema columns are null"; return false; }
+    if (s->ncols <= 0) { if (err_msg) *err_msg = "schema must have at least one column"; return false; }
 
     for (int i = 0; i < s->ncols; i++) {
-        const ColDef &col = s->cols[i];
-        if (!col.name || !col.name[0])
-            return fail("column name is null or empty");
-
-        switch (col.type) {
+        const ColDef *col = &s->cols[i];
+        if (!col->name || !col->name[0]) {
+            if (err_msg) *err_msg = "column name is null or empty";
+            return false;
+        }
+        switch (col->type) {
             case COL_INT32:
             case COL_INT64:
             case COL_DOUBLE:
             case COL_BOOL:
                 break;
             case COL_VARCHAR:
-                if (col.varchar_cap < 2)
-                    return fail("varchar_cap must be >= 2");
+                if (col->varchar_cap < 2) {
+                    if (err_msg) *err_msg = "varchar_cap must be >= 2";
+                    return false;
+                }
                 break;
             default:
-                return fail("invalid column type");
+                if (err_msg) *err_msg = "invalid column type";
+                return false;
         }
     }
     return true;
 }
 
-inline size_t schema_create_ddl_required(const Schema *s, const char *table) {
+static inline size_t schema_create_ddl_required(const Schema *s, const char *table) {
     size_t need = strlen("CREATE TABLE ") + strlen(table) + strlen(" ()") + 1;
     for (int i = 0; i < s->ncols; i++) {
-        need += (i ? 2 : 0);  // ", "
+        need += (i ? 2 : 0);  /* ", " */
         need += strlen(s->cols[i].name);
-        need += 1;            // space
+        need += 1;            /* space */
         need += strlen(coltype_sql_name(s->cols[i].type));
     }
     return need;
 }
 
-inline void schema_create_ddl(const Schema *s, const char *table,
-                              char *buf, int bufsz) {
+static inline void schema_create_ddl(const Schema *s, const char *table,
+                                     char *buf, int bufsz) {
     if (bufsz <= 0) return;
 
     int off = snprintf(buf, bufsz, "CREATE TABLE %s (", table);
@@ -155,21 +179,21 @@ inline void schema_create_ddl(const Schema *s, const char *table,
     }
 }
 
-// ============================================================================
-// Column-Oriented Batch
-// ============================================================================
+/* ============================================================================
+   Column-Oriented Batch
+   ========================================================================= */
 
-static constexpr int BATCH_CAPACITY = 32768;
+enum { BATCH_CAPACITY = 32768 };
 
-struct Batch {
+typedef struct Batch {
     void **col_data;
     int   *col_stride;
     int    ncols;
     int    count;
     int    is_final;
-};
+} Batch;
 
-inline int col_storage_size(const ColDef *col) {
+static inline int col_storage_size(const ColDef *col) {
     switch (col->type) {
         case COL_INT32:   return sizeof(int32_t);
         case COL_INT64:   return sizeof(int64_t);
@@ -180,7 +204,7 @@ inline int col_storage_size(const ColDef *col) {
     return 1;
 }
 
-inline void batch_free(Batch *b) {
+static inline void batch_free(Batch *b) {
     if (!b) return;
     if (b->col_data) {
         for (int c = 0; c < b->ncols; c++) free(b->col_data[c]);
@@ -190,11 +214,11 @@ inline void batch_free(Batch *b) {
     memset(b, 0, sizeof(*b));
 }
 
-inline bool batch_alloc(Batch *b, const Schema *s) {
+static inline bool batch_alloc(Batch *b, const Schema *s) {
     memset(b, 0, sizeof(*b));
     b->ncols = s->ncols;
-    b->col_data = static_cast<void **>(calloc(s->ncols, sizeof(void *)));
-    b->col_stride = static_cast<int *>(calloc(s->ncols, sizeof(int)));
+    b->col_data = (void **)calloc(s->ncols, sizeof(void *));
+    b->col_stride = (int *)calloc(s->ncols, sizeof(int));
     if (!b->col_data || !b->col_stride) {
         batch_free(b);
         return false;
@@ -212,99 +236,99 @@ inline bool batch_alloc(Batch *b, const Schema *s) {
     return true;
 }
 
-// ── Type-safe setters (hot path — compile to single indexed store) ─────────
+/* ── Type-safe setters (hot path — compile to single indexed store) ──── */
 
-inline void batch_set_int32(Batch *b, int col, int row, int32_t v) {
-    static_cast<int32_t *>(b->col_data[col])[row] = v;
+static inline void batch_set_int32(Batch *b, int col, int row, int32_t v) {
+    ((int32_t *)b->col_data[col])[row] = v;
 }
-inline void batch_set_int64(Batch *b, int col, int row, int64_t v) {
-    static_cast<int64_t *>(b->col_data[col])[row] = v;
+static inline void batch_set_int64(Batch *b, int col, int row, int64_t v) {
+    ((int64_t *)b->col_data[col])[row] = v;
 }
-inline void batch_set_double(Batch *b, int col, int row, double v) {
-    static_cast<double *>(b->col_data[col])[row] = v;
+static inline void batch_set_double(Batch *b, int col, int row, double v) {
+    ((double *)b->col_data[col])[row] = v;
 }
-inline void batch_set_bool(Batch *b, int col, int row, int8_t v) {
-    static_cast<int8_t *>(b->col_data[col])[row] = v;
+static inline void batch_set_bool(Batch *b, int col, int row, int8_t v) {
+    ((int8_t *)b->col_data[col])[row] = v;
 }
-inline void batch_set_varchar(Batch *b, int col, int row, const char *v) {
-    char *dst = static_cast<char *>(b->col_data[col]) + row * b->col_stride[col];
+static inline void batch_set_varchar(Batch *b, int col, int row, const char *v) {
+    char *dst = (char *)b->col_data[col] + row * b->col_stride[col];
     strncpy(dst, v, b->col_stride[col] - 1);
     dst[b->col_stride[col] - 1] = '\0';
 }
 
-// ── Getters ────────────────────────────────────────────────────────────────
+/* ── Getters ─────────────────────────────────────────────────────────── */
 
-inline int32_t batch_get_int32(const Batch *b, int col, int row) {
-    return static_cast<int32_t *>(b->col_data[col])[row];
+static inline int32_t batch_get_int32(const Batch *b, int col, int row) {
+    return ((int32_t *)b->col_data[col])[row];
 }
-inline int64_t batch_get_int64(const Batch *b, int col, int row) {
-    return static_cast<int64_t *>(b->col_data[col])[row];
+static inline int64_t batch_get_int64(const Batch *b, int col, int row) {
+    return ((int64_t *)b->col_data[col])[row];
 }
-inline double batch_get_double(const Batch *b, int col, int row) {
-    return static_cast<double *>(b->col_data[col])[row];
+static inline double batch_get_double(const Batch *b, int col, int row) {
+    return ((double *)b->col_data[col])[row];
 }
-inline int8_t batch_get_bool(const Batch *b, int col, int row) {
-    return static_cast<int8_t *>(b->col_data[col])[row];
+static inline int8_t batch_get_bool(const Batch *b, int col, int row) {
+    return ((int8_t *)b->col_data[col])[row];
 }
-inline const char *batch_get_varchar(const Batch *b, int col, int row) {
-    return static_cast<const char *>(b->col_data[col]) + row * b->col_stride[col];
+static inline const char *batch_get_varchar(const Batch *b, int col, int row) {
+    return (const char *)b->col_data[col] + row * b->col_stride[col];
 }
-inline char *batch_get_varchar_mut(Batch *b, int col, int row) {
-    return static_cast<char *>(b->col_data[col]) + row * b->col_stride[col];
+static inline char *batch_get_varchar_mut(Batch *b, int col, int row) {
+    return (char *)b->col_data[col] + row * b->col_stride[col];
 }
 
-// ============================================================================
-// Double Buffer (Lock-Free Ping-Pong)
-// ============================================================================
+/* ============================================================================
+   Double Buffer (Lock-Free Ping-Pong)
+   ========================================================================= */
 
-static constexpr int CACHELINE = 64;
+enum { CACHELINE = 64 };
 
-enum SlotState : int { SLOT_EMPTY = 0, SLOT_READY = 1 };
+typedef enum SlotState { SLOT_EMPTY = 0, SLOT_READY = 1 } SlotState;
 
-struct alignas(CACHELINE) Slot {
-    alignas(CACHELINE) std::atomic<int> state{SLOT_EMPTY};
-    alignas(CACHELINE) Batch batch{};
-};
+typedef struct Slot {
+    alignas(CACHELINE) DFLOW_ATOMIC(int) state;
+    alignas(CACHELINE) Batch batch;
+} Slot;
 
-struct DoubleBuf {
+typedef struct DoubleBuf {
     Slot    slots[2];
-    Schema  schema{};
-    alignas(CACHELINE) std::atomic<long long> consumer_total_rows{0};
-    alignas(CACHELINE) std::atomic<int> consumer_error{0};
-};
+    Schema  schema;
+    alignas(CACHELINE) DFLOW_ATOMIC(long long) consumer_total_rows;
+    alignas(CACHELINE) DFLOW_ATOMIC(int) consumer_error;
+} DoubleBuf;
 
-inline bool slot_is_ready(const Slot *slot) {
-    return slot->state.load(std::memory_order_acquire) == SLOT_READY;
+static inline bool slot_is_ready(const Slot *slot) {
+    return DFLOW_ALOAD(slot->state, DFLOW_ACQ) == SLOT_READY;
 }
 
-inline bool any_slot_ready(const DoubleBuf *db) {
+static inline bool any_slot_ready(const DoubleBuf *db) {
     for (int i = 0; i < 2; i++) {
         if (slot_is_ready(&db->slots[i])) return true;
     }
     return false;
 }
 
-inline char *dup_cstr(const char *s) {
+static inline char *dup_cstr(const char *s) {
     size_t n = strlen(s) + 1;
-    auto *out = static_cast<char *>(malloc(n));
-    if (!out) return nullptr;
+    char *out = (char *)malloc(n);
+    if (!out) return DFLOW_NULL;
     memcpy(out, s, n);
     return out;
 }
 
-inline void schema_destroy_copy(Schema *s) {
+static inline void schema_destroy_copy(Schema *s) {
     if (!s || !s->cols) return;
     for (int i = 0; i < s->ncols; i++) {
-        free(const_cast<char *>(s->cols[i].name));
+        free((char *)s->cols[i].name);
     }
     free(s->cols);
-    s->cols = nullptr;
+    s->cols = DFLOW_NULL;
     s->ncols = 0;
 }
 
-inline bool schema_clone(const Schema *src, Schema *dst) {
+static inline bool schema_clone(const Schema *src, Schema *dst) {
     memset(dst, 0, sizeof(*dst));
-    dst->cols = static_cast<ColDef *>(calloc(src->ncols, sizeof(ColDef)));
+    dst->cols = (ColDef *)calloc(src->ncols, sizeof(ColDef));
     if (!dst->cols) return false;
     dst->ncols = src->ncols;
 
@@ -320,77 +344,81 @@ inline bool schema_clone(const Schema *src, Schema *dst) {
     return true;
 }
 
-inline void cpu_pause() {
+static inline void cpu_pause(void) {
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
     _mm_pause();
 #elif defined(__aarch64__) || defined(__arm__) || defined(_M_ARM64)
     __asm__ __volatile__("yield");
 #else
+  #ifdef __cplusplus
     std::this_thread::yield();
+  #else
+    sched_yield();
+  #endif
 #endif
 }
 
-inline void wait_for_empty(Slot *slot) {
-    while (slot->state.load(std::memory_order_acquire) != SLOT_EMPTY)
+static inline void wait_for_empty(Slot *slot) {
+    while (DFLOW_ALOAD(slot->state, DFLOW_ACQ) != SLOT_EMPTY)
         cpu_pause();
 }
 
-inline bool wait_for_empty_or_error(const DoubleBuf *db, Slot *slot) {
-    while (slot->state.load(std::memory_order_acquire) != SLOT_EMPTY) {
-        if (db && db->consumer_error.load(std::memory_order_acquire) != 0)
+static inline bool wait_for_empty_or_error(const DoubleBuf *db, Slot *slot) {
+    while (DFLOW_ALOAD(slot->state, DFLOW_ACQ) != SLOT_EMPTY) {
+        if (db && DFLOW_ALOAD(db->consumer_error, DFLOW_ACQ) != 0)
             return false;
         cpu_pause();
     }
     return true;
 }
 
-inline void publish_batch(Slot *slot, int count, int is_final) {
+static inline void publish_batch(Slot *slot, int count, int is_final) {
     slot->batch.count = count;
     slot->batch.is_final = is_final;
-    slot->state.store(SLOT_READY, std::memory_order_release);
+    DFLOW_ASTORE(slot->state, SLOT_READY, DFLOW_REL);
 }
 
-inline DoubleBuf *doublebuf_create(const Schema *s) {
-    const char *schema_err = nullptr;
-    if (!schema_validate(s, &schema_err)) return nullptr;
+static inline DoubleBuf *doublebuf_create(const Schema *s) {
+    const char *schema_err = DFLOW_NULL;
+    if (!schema_validate(s, &schema_err)) return DFLOW_NULL;
 
-    void *mem = nullptr;
+    void *mem = DFLOW_NULL;
     if (posix_memalign(&mem, CACHELINE, sizeof(DoubleBuf)) != 0 || !mem)
-        return nullptr;
-    auto *db = new (mem) DoubleBuf{};
+        return DFLOW_NULL;
+    memset(mem, 0, sizeof(DoubleBuf));
+    DoubleBuf *db = (DoubleBuf *)mem;
+
     if (!schema_clone(s, &db->schema)) {
-        db->~DoubleBuf();
         free(db);
-        return nullptr;
+        return DFLOW_NULL;
     }
     for (int i = 0; i < 2; i++) {
         if (!batch_alloc(&db->slots[i].batch, &db->schema)) {
             for (int j = 0; j < i; j++) batch_free(&db->slots[j].batch);
             schema_destroy_copy(&db->schema);
-            db->~DoubleBuf();
             free(db);
-            return nullptr;
+            return DFLOW_NULL;
         }
     }
     return db;
 }
 
-inline void doublebuf_destroy(DoubleBuf *db) {
+static inline void doublebuf_destroy(DoubleBuf *db) {
     if (!db) return;
     for (int i = 0; i < 2; i++) batch_free(&db->slots[i].batch);
     schema_destroy_copy(&db->schema);
-    db->~DoubleBuf();
     free(db);
 }
 
-// ============================================================================
-// Consumer: Generic Drain (schema-driven, calls DuckDB appender per cell)
-// ============================================================================
+/* ============================================================================
+   Consumer: Generic Drain (schema-driven, calls DuckDB appender per cell)
+   ========================================================================= */
 
-static constexpr int FLUSH_EVERY = 500000;
+enum { FLUSH_EVERY = 500000 };
 
-inline duckdb_state append_batch_cell(const Batch *b, const Schema *s, int row,
-                                      int c, duckdb_appender appender) {
+static inline duckdb_state append_batch_cell(const Batch *b, const Schema *s,
+                                             int row, int c,
+                                             duckdb_appender appender) {
     switch (s->cols[c].type) {
         case COL_INT32:
             return duckdb_append_int32(appender, batch_get_int32(b, c, row));
@@ -406,8 +434,8 @@ inline duckdb_state append_batch_cell(const Batch *b, const Schema *s, int row,
     return DuckDBError;
 }
 
-inline bool drain_batch_to_appender(const Batch *b, const Schema *s,
-                                    duckdb_appender appender) {
+static inline bool drain_batch_to_appender(const Batch *b, const Schema *s,
+                                           duckdb_appender appender) {
     for (int row = 0; row < b->count; row++) {
         for (int c = 0; c < s->ncols; c++) {
             if (append_batch_cell(b, s, row, c, appender) == DuckDBError)
@@ -418,38 +446,38 @@ inline bool drain_batch_to_appender(const Batch *b, const Schema *s,
     return true;
 }
 
-// ============================================================================
-// Deterministic Data Generation
-//
-// Given (seq, col_index), every cell value is deterministic.
-// Used by producers to fill, and by verifiers to check.
-// ============================================================================
+/* ============================================================================
+   Deterministic Data Generation
 
-inline int32_t expected_int32(int64_t seq, int col) {
-    return static_cast<int32_t>((seq * 31 + col * 7) ^ 0xDEAD);
+   Given (seq, col_index), every cell value is deterministic.
+   Used by producers to fill, and by verifiers to check.
+   ========================================================================= */
+
+static inline int32_t expected_int32(int64_t seq, int col) {
+    return (int32_t)((seq * 31 + col * 7) ^ 0xDEAD);
 }
 
-inline int64_t expected_int64(int64_t seq, int col) {
+static inline int64_t expected_int64(int64_t seq, int col) {
     return (seq * 1000003LL + col * 999983LL) ^ 0xCAFEBABE;
 }
 
-inline double expected_double(int64_t seq, int col) {
-    return static_cast<double>(seq % 100000) * 0.001 + col * 1.1;
+static inline double expected_double(int64_t seq, int col) {
+    return (double)(seq % 100000) * 0.001 + col * 1.1;
 }
 
-inline int8_t expected_bool(int64_t seq, int col) {
-    return static_cast<int8_t>(((seq + col) % 3) == 0 ? 1 : 0);
+static inline int8_t expected_bool(int64_t seq, int col) {
+    return (int8_t)(((seq + col) % 3) == 0 ? 1 : 0);
 }
 
-inline void expected_varchar(int64_t seq, int col, int cap, char *buf) {
+static inline void expected_varchar(int64_t seq, int col, int cap, char *buf) {
     if (!buf || cap <= 0) return;
-    snprintf(buf, static_cast<size_t>(cap), "R%lldC%d_%llx",
-             static_cast<long long>(seq), col,
-             static_cast<unsigned long long>(seq * 37 + col));
+    snprintf(buf, (size_t)cap, "R%lldC%d_%llx",
+             (long long)seq, col,
+             (unsigned long long)(seq * 37 + col));
 }
 
-inline void fill_row_deterministic(Batch *b, int row, int64_t seq,
-                                    const Schema *s) {
+static inline void fill_row_deterministic(Batch *b, int row, int64_t seq,
+                                          const Schema *s) {
     for (int c = 0; c < s->ncols; c++) {
         switch (s->cols[c].type) {
             case COL_INT32:
