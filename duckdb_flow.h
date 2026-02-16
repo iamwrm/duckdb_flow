@@ -359,6 +359,7 @@ typedef struct DoubleBuf {
     Schema  schema;
     alignas(CACHELINE) DFLOW_ATOMIC(long long) consumer_total_rows;
     alignas(CACHELINE) DFLOW_ATOMIC(int) consumer_error;
+    char    consumer_error_msg[256];
 } DoubleBuf;
 
 static inline bool slot_is_ready(const Slot *slot) {
@@ -474,6 +475,17 @@ static inline void doublebuf_destroy(DoubleBuf *db) {
     for (int i = 0; i < 2; i++) batch_free(&db->slots[i].batch);
     schema_destroy_copy(&db->schema);
     free(db);
+}
+
+/* Store an error message and set the error flag (first message wins).
+   The message write happens-before the release store on consumer_error,
+   so it is visible to any thread that observes the flag via acquire load. */
+static inline void doublebuf_set_error(DoubleBuf *db, const char *msg) {
+    if (db->consumer_error_msg[0] == '\0' && msg) {
+        strncpy(db->consumer_error_msg, msg, sizeof(db->consumer_error_msg) - 1);
+        db->consumer_error_msg[sizeof(db->consumer_error_msg) - 1] = '\0';
+    }
+    DFLOW_ASTORE(db->consumer_error, 1, DFLOW_REL);
 }
 
 /* ============================================================================

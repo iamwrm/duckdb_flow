@@ -102,16 +102,26 @@ static void *consumer_thread(void *arg) {
     DoubleBuf *dbuf = ctx->dbuf;
     const Schema *s = &dbuf->schema;
 
-    duckdb_database db;
-    duckdb_connection con;
+    duckdb_database db = nullptr;
+    duckdb_connection con = nullptr;
     duckdb_config config;
     duckdb_create_config(&config);
     duckdb_set_config(config, "memory_limit", "256MB");
     duckdb_set_config(config, "threads", "2");
     char *err = nullptr;
-    duckdb_open_ext(ctx->db_path, &db, config, &err);
+    if (duckdb_open_ext(ctx->db_path, &db, config, &err) == DuckDBError) {
+        duckdb_destroy_config(&config);
+        doublebuf_set_error(dbuf, err ? err : "duckdb_open_ext failed");
+        if (err) duckdb_free(err);
+        return nullptr;
+    }
     duckdb_destroy_config(&config);
-    duckdb_connect(db, &con);
+    if (err) { duckdb_free(err); err = nullptr; }
+    if (duckdb_connect(db, &con) == DuckDBError) {
+        doublebuf_set_error(dbuf, "duckdb_connect failed");
+        duckdb_close(&db);
+        return nullptr;
+    }
 
     duckdb_result res;
     char sql[4096];
@@ -120,8 +130,7 @@ static void *consumer_thread(void *arg) {
 
     schema_create_ddl(s, ctx->table_name, sql, sizeof(sql));
     if (duckdb_query(con, sql, &res) == DuckDBError) {
-        fprintf(stderr, "  [consumer] DDL failed: %s\n",
-                duckdb_result_error(&res));
+        doublebuf_set_error(dbuf, duckdb_result_error(&res));
         duckdb_destroy_result(&res);
         duckdb_disconnect(&con); duckdb_close(&db);
         return nullptr;
@@ -129,7 +138,12 @@ static void *consumer_thread(void *arg) {
     duckdb_destroy_result(&res);
 
     duckdb_appender appender;
-    duckdb_appender_create(con, nullptr, ctx->table_name, &appender);
+    if (duckdb_appender_create(con, nullptr, ctx->table_name, &appender)
+            == DuckDBError) {
+        doublebuf_set_error(dbuf, "duckdb_appender_create failed");
+        duckdb_disconnect(&con); duckdb_close(&db);
+        return nullptr;
+    }
 
     long long total = 0, since_flush = 0;
     bool saw_final = false;
@@ -146,7 +160,7 @@ static void *consumer_thread(void *arg) {
             bool final = b->is_final;
 
             if (!drain_batch_to_appender(b, s, appender)) {
-                dbuf->consumer_error.store(1, std::memory_order_release);
+                doublebuf_set_error(dbuf, duckdb_appender_error(appender));
                 failed = true;
                 dbuf->slots[si].state.store(SLOT_EMPTY, std::memory_order_release);
                 break;
@@ -156,7 +170,7 @@ static void *consumer_thread(void *arg) {
 
             if (since_flush >= FLUSH_EVERY) {
                 if (duckdb_appender_flush(appender) == DuckDBError) {
-                    dbuf->consumer_error.store(1, std::memory_order_release);
+                    doublebuf_set_error(dbuf, duckdb_appender_error(appender));
                     failed = true;
                     dbuf->slots[si].state.store(SLOT_EMPTY, std::memory_order_release);
                     break;
@@ -188,7 +202,7 @@ static void *consumer_thread(void *arg) {
     }
 
     if (duckdb_appender_destroy(&appender) == DuckDBError) {
-        dbuf->consumer_error.store(1, std::memory_order_release);
+        doublebuf_set_error(dbuf, "duckdb_appender_destroy failed");
     }
     dbuf->consumer_total_rows.store(total);
 
@@ -541,6 +555,9 @@ static int run_one(const Schema *schema, int nrows, int slow_us,
 
     long long consumed = dbuf->consumer_total_rows.load();
     bool consumer_failed = dbuf->consumer_error.load(std::memory_order_acquire) != 0;
+    char error_msg[256] = {0};
+    if (consumer_failed)
+        memcpy(error_msg, dbuf->consumer_error_msg, sizeof(error_msg));
     doublebuf_destroy(dbuf);
 
     VerifyResult vr;
@@ -575,7 +592,8 @@ static int run_one(const Schema *schema, int nrows, int slow_us,
         if (!producer_ok)
             printf("     TRANSPORT: producer error\n");
         if (consumer_failed)
-            printf("     TRANSPORT: consumer error\n");
+            printf("     TRANSPORT: consumer error: %s\n",
+                   error_msg[0] ? error_msg : "unknown");
         if (consumed != nrows)
             printf("     TRANSPORT: produced=%d consumed=%lld\n",
                    nrows, consumed);

@@ -46,7 +46,7 @@ static bool drain_ready_batches(DoubleBuf *dbuf, const Schema *s,
 
         if (!drain_batch_to_appender(b, s, appender)) {
             slot->state.store(SLOT_EMPTY, std::memory_order_release);
-            dbuf->consumer_error.store(1, std::memory_order_release);
+            doublebuf_set_error(dbuf, duckdb_appender_error(appender));
             *failed = true;
             return drained_any;
         }
@@ -56,7 +56,7 @@ static bool drain_ready_batches(DoubleBuf *dbuf, const Schema *s,
         if (*since_flush >= FLUSH_EVERY) {
             if (duckdb_appender_flush(appender) == DuckDBError) {
                 slot->state.store(SLOT_EMPTY, std::memory_order_release);
-                dbuf->consumer_error.store(1, std::memory_order_release);
+                doublebuf_set_error(dbuf, duckdb_appender_error(appender));
                 *failed = true;
                 return drained_any;
             }
@@ -86,28 +86,42 @@ static void *consumer_thread(void *arg) {
     bool failed = false;
 
     duckdb_create_config(&config);
-    if (duckdb_set_config(config, "memory_limit", "256MB") == DuckDBError)
+    if (duckdb_set_config(config, "memory_limit", "256MB") == DuckDBError) {
+        doublebuf_set_error(dbuf, "duckdb_set_config(memory_limit) failed");
         failed = true;
-    if (!failed && duckdb_set_config(config, "threads", "2") == DuckDBError)
+    }
+    if (!failed && duckdb_set_config(config, "threads", "2") == DuckDBError) {
+        doublebuf_set_error(dbuf, "duckdb_set_config(threads) failed");
         failed = true;
+    }
     if (!failed &&
-        duckdb_open_ext(ctx->db_path, &db, config, &err) == DuckDBError)
+        duckdb_open_ext(ctx->db_path, &db, config, &err) == DuckDBError) {
+        doublebuf_set_error(dbuf, err ? err : "duckdb_open_ext failed");
         failed = true;
+    }
     duckdb_destroy_config(&config);
     config = nullptr;
 
-    if (!failed && duckdb_connect(db, &con) == DuckDBError) failed = true;
+    if (!failed && duckdb_connect(db, &con) == DuckDBError) {
+        doublebuf_set_error(dbuf, "duckdb_connect failed");
+        failed = true;
+    }
 
     if (!failed) {
         drop_sql = alloc_table_sql("DROP TABLE IF EXISTS ", ctx->table_name);
-        failed = (drop_sql == nullptr);
+        if (!drop_sql) {
+            doublebuf_set_error(dbuf, "alloc_table_sql failed");
+            failed = true;
+        }
     }
 
     if (!failed) {
         size_t ddl_cap = schema_create_ddl_required(s, ctx->table_name);
         ddl_sql = static_cast<char *>(malloc(ddl_cap));
-        failed = (ddl_sql == nullptr);
-        if (!failed) {
+        if (!ddl_sql) {
+            doublebuf_set_error(dbuf, "malloc failed for DDL");
+            failed = true;
+        } else {
             schema_create_ddl(s, ctx->table_name, ddl_sql,
                               static_cast<int>(ddl_cap));
         }
@@ -115,19 +129,26 @@ static void *consumer_thread(void *arg) {
 
     if (!failed) {
         duckdb_result res;
-        if (duckdb_query(con, drop_sql, &res) == DuckDBError) failed = true;
+        if (duckdb_query(con, drop_sql, &res) == DuckDBError) {
+            doublebuf_set_error(dbuf, duckdb_result_error(&res));
+            failed = true;
+        }
         duckdb_destroy_result(&res);
     }
 
     if (!failed) {
         duckdb_result res;
-        if (duckdb_query(con, ddl_sql, &res) == DuckDBError) failed = true;
+        if (duckdb_query(con, ddl_sql, &res) == DuckDBError) {
+            doublebuf_set_error(dbuf, duckdb_result_error(&res));
+            failed = true;
+        }
         duckdb_destroy_result(&res);
     }
 
     if (!failed &&
         duckdb_appender_create(con, nullptr, ctx->table_name, &appender)
             == DuckDBError) {
+        doublebuf_set_error(dbuf, "duckdb_appender_create failed");
         failed = true;
     }
     appender_created = !failed;
@@ -145,9 +166,8 @@ static void *consumer_thread(void *arg) {
 
     if (appender_created &&
         duckdb_appender_destroy(&appender) == DuckDBError) {
-        failed = true;
+        doublebuf_set_error(dbuf, "duckdb_appender_destroy failed");
     }
-    if (failed) dbuf->consumer_error.store(1, std::memory_order_release);
     dbuf->consumer_total_rows.store(total);
 
     if (err) duckdb_free(err);
@@ -265,6 +285,9 @@ static DemoResult run_demo(const char *label, Schema *schema, int total_rows) {
 
     long long consumed = dbuf->consumer_total_rows.load();
     bool consumer_failed = dbuf->consumer_error.load(std::memory_order_acquire) != 0;
+    char error_msg[256] = {0};
+    if (consumer_failed)
+        memcpy(error_msg, dbuf->consumer_error_msg, sizeof(error_msg));
     doublebuf_destroy(dbuf);
 
     // Verify count in DB
@@ -292,7 +315,8 @@ static DemoResult run_demo(const char *label, Schema *schema, int total_rows) {
     printf("  Consumed:    %lld rows\n", consumed);
     printf("  DB count:    %lld rows\n", db_count);
     if (!producer_ok)    printf("  Producer:    ERROR\n");
-    if (consumer_failed) printf("  Consumer:    ERROR\n");
+    if (consumer_failed) printf("  Consumer:    ERROR (%s)\n",
+                                error_msg[0] ? error_msg : "unknown");
     if (!db_ok)          printf("  Verifier:    ERROR\n");
     printf("  Time:        %.3f s\n", elapsed);
     printf("  Throughput:  %.2f M rows/sec\n", mrows);
