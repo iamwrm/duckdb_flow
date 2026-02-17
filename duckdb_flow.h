@@ -2,18 +2,9 @@
 /* ============================================================================
    duckdb_flow.h — Schema-generic double-buffered appender for DuckDB
 
-   Hot-thread-safe column-oriented batching with lock-free ping-pong handoff.
-   The producer (hot thread) never touches DuckDB; the consumer (background
-   thread) drains batches through the DuckDB C appender API.
-
+   Lock-free ping-pong buffer between a hot producer thread and a background
+   consumer that drains batches through the DuckDB C appender API.
    Compiles as both C11 and C++17.
-
-   Usage:
-     1. Define a Schema (array of ColDef)
-     2. Create a DoubleBuf
-     3. Producer fills rows via batch_set_* and publishes with publish_batch()
-     4. Consumer drains via drain_batch_to_appender()
-     5. Shutdown: producer sends a batch with is_final=1
    ========================================================================= */
 
 #ifdef __cplusplus
@@ -54,33 +45,21 @@
 
 #include "duckdb.h"
 
-/* ============================================================================
-   Schema Definition
-   ========================================================================= */
+/* ── Schema ─────────────────────────────────────────────────────────────── */
 
 typedef enum ColType {
-    COL_INT32   = 0,
-    COL_INT64   = 1,
-    COL_DOUBLE  = 2,
-    COL_BOOL    = 3,
-    COL_VARCHAR = 4,
-    COL_UINT32  = 5,
-    COL_UINT64  = 6,
-    COL_FLOAT   = 7,
+    COL_INT32 = 0, COL_INT64 = 1, COL_DOUBLE = 2, COL_BOOL    = 3,
+    COL_VARCHAR = 4, COL_UINT32 = 5, COL_UINT64 = 6, COL_FLOAT = 7,
     COL_DECIMAL = 8
 } ColType;
 
 typedef struct ColDef {
     const char *name;
     ColType     type;
-    int         varchar_cap;    /* COL_VARCHAR: max string length */
-    uint8_t     decimal_width;  /* COL_DECIMAL: precision (1-38) */
+    int         varchar_cap;    /* COL_VARCHAR: max string length (≥2) */
+    uint8_t     decimal_width;  /* COL_DECIMAL: precision 1-18 */
     uint8_t     decimal_scale;  /* COL_DECIMAL: digits after decimal point */
 } ColDef;
-
-/* Legacy/demo baseline used by tests. The implementation itself has no
-   internal hard cap on schema columns. */
-enum { MAX_COLS = 32 };
 
 typedef struct Schema {
     ColDef *cols;
@@ -102,122 +81,59 @@ static inline const char *coltype_sql_name(ColType t) {
     return "VARCHAR";
 }
 
-static inline const char *coltype_name(ColType t) {
-    switch (t) {
-        case COL_INT32:   return "INT32";
-        case COL_INT64:   return "INT64";
-        case COL_DOUBLE:  return "DOUBLE";
-        case COL_BOOL:    return "BOOL";
-        case COL_VARCHAR: return "VARCHAR";
-        case COL_UINT32:  return "UINT32";
-        case COL_UINT64:  return "UINT64";
-        case COL_FLOAT:   return "FLOAT";
-        case COL_DECIMAL: return "DECIMAL";
-    }
-    return "?";
-}
-
-static inline bool schema_validate(const Schema *s, const char **err_msg) {
-    if (!s) { if (err_msg) *err_msg = "schema is null"; return false; }
-    if (!s->cols) { if (err_msg) *err_msg = "schema columns are null"; return false; }
-    if (s->ncols <= 0) { if (err_msg) *err_msg = "schema must have at least one column"; return false; }
+static inline bool schema_validate(const Schema *s, const char **err) {
+    if (!s)       { if (err) *err = "schema is null";       return false; }
+    if (!s->cols) { if (err) *err = "columns are null";     return false; }
+    if (s->ncols <= 0) { if (err) *err = "need ≥1 column"; return false; }
 
     for (int i = 0; i < s->ncols; i++) {
-        const ColDef *col = &s->cols[i];
-        if (!col->name || !col->name[0]) {
-            if (err_msg) *err_msg = "column name is null or empty";
+        const ColDef *c = &s->cols[i];
+        if (!c->name || !c->name[0]) {
+            if (err) *err = "column name is null or empty";
             return false;
         }
-        switch (col->type) {
-            case COL_INT32:
-            case COL_INT64:
-            case COL_DOUBLE:
-            case COL_BOOL:
-            case COL_UINT32:
-            case COL_UINT64:
-            case COL_FLOAT:
-                break;
-            case COL_VARCHAR:
-                if (col->varchar_cap < 2) {
-                    if (err_msg) *err_msg = "varchar_cap must be >= 2";
-                    return false;
-                }
-                break;
-            case COL_DECIMAL:
-                if (col->decimal_width < 1 || col->decimal_width > 18) {
-                    if (err_msg) *err_msg = "decimal_width must be 1-18";
-                    return false;
-                }
-                if (col->decimal_scale > col->decimal_width) {
-                    if (err_msg) *err_msg = "decimal_scale must be <= decimal_width";
-                    return false;
-                }
-                break;
-            default:
-                if (err_msg) *err_msg = "invalid column type";
+        if (c->type == COL_VARCHAR && c->varchar_cap < 2) {
+            if (err) *err = "varchar_cap must be >= 2";
+            return false;
+        }
+        if (c->type == COL_DECIMAL) {
+            if (c->decimal_width < 1 || c->decimal_width > 18) {
+                if (err) *err = "decimal_width must be 1-18";
                 return false;
+            }
+            if (c->decimal_scale > c->decimal_width) {
+                if (err) *err = "decimal_scale must be <= decimal_width";
+                return false;
+            }
+        }
+        if ((unsigned)c->type > COL_DECIMAL) {
+            if (err) *err = "invalid column type";
+            return false;
         }
     }
     return true;
 }
 
-static inline size_t schema_create_ddl_required(const Schema *s, const char *table) {
-    size_t need = strlen("CREATE TABLE ") + strlen(table) + strlen(" ()") + 1;
-    for (int i = 0; i < s->ncols; i++) {
-        need += (i ? 2 : 0);  /* ", " */
-        need += strlen(s->cols[i].name);
-        need += 1;            /* space */
-        need += strlen(coltype_sql_name(s->cols[i].type));
-        if (s->cols[i].type == COL_DECIMAL)
-            need += 10;       /* "(xx,yy)" with room to spare */
-    }
-    return need;
-}
-
 static inline void schema_create_ddl(const Schema *s, const char *table,
                                      char *buf, int bufsz) {
     if (bufsz <= 0) return;
-
     int off = snprintf(buf, bufsz, "CREATE TABLE %s (", table);
-    if (off < 0 || off >= bufsz) {
-        buf[bufsz - 1] = '\0';
-        return;
-    }
-
-    for (int i = 0; i < s->ncols; i++) {
+    for (int i = 0; i < s->ncols && off < bufsz; i++) {
         int rem = bufsz - off;
-        if (rem <= 0) break;
-        int w;
-        if (s->cols[i].type == COL_DECIMAL) {
-            w = snprintf(buf + off, rem, "%s%s DECIMAL(%d,%d)",
-                         i ? ", " : "", s->cols[i].name,
-                         s->cols[i].decimal_width, s->cols[i].decimal_scale);
-        } else {
-            w = snprintf(buf + off, rem, "%s%s %s",
-                         i ? ", " : "", s->cols[i].name,
-                         coltype_sql_name(s->cols[i].type));
-        }
-        if (w < 0) {
-            buf[bufsz - 1] = '\0';
-            return;
-        }
-        if (w >= rem) {
-            off = bufsz - 1;
-            break;
-        }
-        off += w;
+        if (s->cols[i].type == COL_DECIMAL)
+            off += snprintf(buf + off, rem, "%s%s DECIMAL(%d,%d)",
+                            i ? ", " : "", s->cols[i].name,
+                            s->cols[i].decimal_width, s->cols[i].decimal_scale);
+        else
+            off += snprintf(buf + off, rem, "%s%s %s",
+                            i ? ", " : "", s->cols[i].name,
+                            coltype_sql_name(s->cols[i].type));
+        if (off < 0) { buf[bufsz - 1] = '\0'; return; }
     }
-
-    if (off < bufsz) {
-        snprintf(buf + off, bufsz - off, ")");
-    } else {
-        buf[bufsz - 1] = '\0';
-    }
+    if (off < bufsz) snprintf(buf + off, bufsz - off, ")");
 }
 
-/* ============================================================================
-   Column-Oriented Batch
-   ========================================================================= */
+/* ── Column-Oriented Batch ──────────────────────────────────────────────── */
 
 enum { BATCH_CAPACITY = 32768 };
 
@@ -246,9 +162,8 @@ static inline int col_storage_size(const ColDef *col) {
 
 static inline void batch_free(Batch *b) {
     if (!b) return;
-    if (b->col_data) {
+    if (b->col_data)
         for (int c = 0; c < b->ncols; c++) free(b->col_data[c]);
-    }
     free(b->col_data);
     free(b->col_stride);
     memset(b, 0, sizeof(*b));
@@ -257,26 +172,20 @@ static inline void batch_free(Batch *b) {
 static inline bool batch_alloc(Batch *b, const Schema *s) {
     memset(b, 0, sizeof(*b));
     b->ncols = s->ncols;
-    b->col_data = (void **)calloc(s->ncols, sizeof(void *));
+    b->col_data   = (void **)calloc(s->ncols, sizeof(void *));
     b->col_stride = (int *)calloc(s->ncols, sizeof(int));
-    if (!b->col_data || !b->col_stride) {
-        batch_free(b);
-        return false;
-    }
+    if (!b->col_data || !b->col_stride) { batch_free(b); return false; }
 
     for (int c = 0; c < s->ncols; c++) {
         int es = col_storage_size(&s->cols[c]);
         b->col_stride[c] = es;
         b->col_data[c] = calloc(BATCH_CAPACITY, es);
-        if (!b->col_data[c]) {
-            batch_free(b);
-            return false;
-        }
+        if (!b->col_data[c]) { batch_free(b); return false; }
     }
     return true;
 }
 
-/* ── Type-safe setters (hot path — compile to single indexed store) ──── */
+/* ── Setters (hot path — single indexed store) ─────────────────────────── */
 
 static inline void batch_set_int32(Batch *b, int col, int row, int32_t v) {
     ((int32_t *)b->col_data[col])[row] = v;
@@ -308,18 +217,18 @@ static inline void batch_set_decimal(Batch *b, int col, int row, double v) {
     ((double *)b->col_data[col])[row] = v;
 }
 
-/* ── Getters ─────────────────────────────────────────────────────────── */
+/* ── Getters ───────────────────────────────────────────────────────────── */
 
-static inline int32_t batch_get_int32(const Batch *b, int col, int row) {
+static inline int32_t  batch_get_int32(const Batch *b, int col, int row) {
     return ((int32_t *)b->col_data[col])[row];
 }
-static inline int64_t batch_get_int64(const Batch *b, int col, int row) {
+static inline int64_t  batch_get_int64(const Batch *b, int col, int row) {
     return ((int64_t *)b->col_data[col])[row];
 }
-static inline double batch_get_double(const Batch *b, int col, int row) {
+static inline double   batch_get_double(const Batch *b, int col, int row) {
     return ((double *)b->col_data[col])[row];
 }
-static inline int8_t batch_get_bool(const Batch *b, int col, int row) {
+static inline int8_t   batch_get_bool(const Batch *b, int col, int row) {
     return ((int8_t *)b->col_data[col])[row];
 }
 static inline const char *batch_get_varchar(const Batch *b, int col, int row) {
@@ -334,16 +243,14 @@ static inline uint32_t batch_get_uint32(const Batch *b, int col, int row) {
 static inline uint64_t batch_get_uint64(const Batch *b, int col, int row) {
     return ((uint64_t *)b->col_data[col])[row];
 }
-static inline float batch_get_float(const Batch *b, int col, int row) {
+static inline float    batch_get_float(const Batch *b, int col, int row) {
     return ((float *)b->col_data[col])[row];
 }
-static inline double batch_get_decimal(const Batch *b, int col, int row) {
+static inline double   batch_get_decimal(const Batch *b, int col, int row) {
     return ((double *)b->col_data[col])[row];
 }
 
-/* ============================================================================
-   Double Buffer (Lock-Free Ping-Pong)
-   ========================================================================= */
+/* ── Double Buffer (Lock-Free Ping-Pong) ───────────────────────────────── */
 
 enum { CACHELINE = 64 };
 
@@ -367,25 +274,12 @@ static inline bool slot_is_ready(const Slot *slot) {
 }
 
 static inline bool any_slot_ready(const DoubleBuf *db) {
-    for (int i = 0; i < 2; i++) {
-        if (slot_is_ready(&db->slots[i])) return true;
-    }
-    return false;
-}
-
-static inline char *dup_cstr(const char *s) {
-    size_t n = strlen(s) + 1;
-    char *out = (char *)malloc(n);
-    if (!out) return DFLOW_NULL;
-    memcpy(out, s, n);
-    return out;
+    return slot_is_ready(&db->slots[0]) || slot_is_ready(&db->slots[1]);
 }
 
 static inline void schema_destroy_copy(Schema *s) {
     if (!s || !s->cols) return;
-    for (int i = 0; i < s->ncols; i++) {
-        free((char *)s->cols[i].name);
-    }
+    for (int i = 0; i < s->ncols; i++) free((char *)s->cols[i].name);
     free(s->cols);
     s->cols = DFLOW_NULL;
     s->ncols = 0;
@@ -398,15 +292,12 @@ static inline bool schema_clone(const Schema *src, Schema *dst) {
     dst->ncols = src->ncols;
 
     for (int i = 0; i < src->ncols; i++) {
-        dst->cols[i].type = src->cols[i].type;
-        dst->cols[i].varchar_cap = src->cols[i].varchar_cap;
-        dst->cols[i].decimal_width = src->cols[i].decimal_width;
-        dst->cols[i].decimal_scale = src->cols[i].decimal_scale;
-        dst->cols[i].name = dup_cstr(src->cols[i].name);
-        if (!dst->cols[i].name) {
-            schema_destroy_copy(dst);
-            return false;
-        }
+        dst->cols[i] = src->cols[i];
+        size_t n = strlen(src->cols[i].name) + 1;
+        char *name = (char *)malloc(n);
+        if (!name) { schema_destroy_copy(dst); return false; }
+        memcpy(name, src->cols[i].name, n);
+        dst->cols[i].name = name;
     }
     return true;
 }
@@ -425,11 +316,6 @@ static inline void cpu_pause(void) {
 #endif
 }
 
-static inline void wait_for_empty(Slot *slot) {
-    while (DFLOW_ALOAD(slot->state, DFLOW_ACQ) != SLOT_EMPTY)
-        cpu_pause();
-}
-
 static inline bool wait_for_empty_or_error(const DoubleBuf *db, Slot *slot) {
     while (DFLOW_ALOAD(slot->state, DFLOW_ACQ) != SLOT_EMPTY) {
         if (db && DFLOW_ALOAD(db->consumer_error, DFLOW_ACQ) != 0)
@@ -446,8 +332,8 @@ static inline void publish_batch(Slot *slot, int count, int is_final) {
 }
 
 static inline DoubleBuf *doublebuf_create(const Schema *s) {
-    const char *schema_err = DFLOW_NULL;
-    if (!schema_validate(s, &schema_err)) return DFLOW_NULL;
+    const char *err = DFLOW_NULL;
+    if (!schema_validate(s, &err)) return DFLOW_NULL;
 
     void *mem = DFLOW_NULL;
     if (posix_memalign(&mem, CACHELINE, sizeof(DoubleBuf)) != 0 || !mem)
@@ -455,10 +341,7 @@ static inline DoubleBuf *doublebuf_create(const Schema *s) {
     memset(mem, 0, sizeof(DoubleBuf));
     DoubleBuf *db = (DoubleBuf *)mem;
 
-    if (!schema_clone(s, &db->schema)) {
-        free(db);
-        return DFLOW_NULL;
-    }
+    if (!schema_clone(s, &db->schema)) { free(db); return DFLOW_NULL; }
     for (int i = 0; i < 2; i++) {
         if (!batch_alloc(&db->slots[i].batch, &db->schema)) {
             for (int j = 0; j < i; j++) batch_free(&db->slots[j].batch);
@@ -477,9 +360,7 @@ static inline void doublebuf_destroy(DoubleBuf *db) {
     free(db);
 }
 
-/* Store an error message and set the error flag (first message wins).
-   The message write happens-before the release store on consumer_error,
-   so it is visible to any thread that observes the flag via acquire load. */
+/* Set consumer error (first message wins, release-ordered). */
 static inline void doublebuf_set_error(DoubleBuf *db, const char *msg) {
     if (db->consumer_error_msg[0] == '\0' && msg) {
         strncpy(db->consumer_error_msg, msg, sizeof(db->consumer_error_msg) - 1);
@@ -488,9 +369,7 @@ static inline void doublebuf_set_error(DoubleBuf *db, const char *msg) {
     DFLOW_ASTORE(db->consumer_error, 1, DFLOW_REL);
 }
 
-/* ============================================================================
-   Consumer: Generic Drain (schema-driven, calls DuckDB appender per cell)
-   ========================================================================= */
+/* ── Consumer: drain batch → DuckDB appender ───────────────────────────── */
 
 enum { FLUSH_EVERY = 500000 };
 
@@ -498,24 +377,15 @@ static inline duckdb_state append_batch_cell(const Batch *b, const Schema *s,
                                              int row, int c,
                                              duckdb_appender appender) {
     switch (s->cols[c].type) {
-        case COL_INT32:
-            return duckdb_append_int32(appender, batch_get_int32(b, c, row));
-        case COL_INT64:
-            return duckdb_append_int64(appender, batch_get_int64(b, c, row));
-        case COL_DOUBLE:
-            return duckdb_append_double(appender, batch_get_double(b, c, row));
-        case COL_BOOL:
-            return duckdb_append_bool(appender, batch_get_bool(b, c, row));
-        case COL_VARCHAR:
-            return duckdb_append_varchar(appender, batch_get_varchar(b, c, row));
-        case COL_UINT32:
-            return duckdb_append_uint32(appender, batch_get_uint32(b, c, row));
-        case COL_UINT64:
-            return duckdb_append_uint64(appender, batch_get_uint64(b, c, row));
-        case COL_FLOAT:
-            return duckdb_append_float(appender, batch_get_float(b, c, row));
-        case COL_DECIMAL:
-            return duckdb_append_double(appender, batch_get_decimal(b, c, row));
+        case COL_INT32:   return duckdb_append_int32(appender, batch_get_int32(b, c, row));
+        case COL_INT64:   return duckdb_append_int64(appender, batch_get_int64(b, c, row));
+        case COL_DOUBLE:  return duckdb_append_double(appender, batch_get_double(b, c, row));
+        case COL_BOOL:    return duckdb_append_bool(appender, batch_get_bool(b, c, row));
+        case COL_VARCHAR: return duckdb_append_varchar(appender, batch_get_varchar(b, c, row));
+        case COL_UINT32:  return duckdb_append_uint32(appender, batch_get_uint32(b, c, row));
+        case COL_UINT64:  return duckdb_append_uint64(appender, batch_get_uint64(b, c, row));
+        case COL_FLOAT:   return duckdb_append_float(appender, batch_get_float(b, c, row));
+        case COL_DECIMAL: return duckdb_append_double(appender, batch_get_decimal(b, c, row));
     }
     return DuckDBError;
 }
@@ -523,111 +393,10 @@ static inline duckdb_state append_batch_cell(const Batch *b, const Schema *s,
 static inline bool drain_batch_to_appender(const Batch *b, const Schema *s,
                                            duckdb_appender appender) {
     for (int row = 0; row < b->count; row++) {
-        for (int c = 0; c < s->ncols; c++) {
+        for (int c = 0; c < s->ncols; c++)
             if (append_batch_cell(b, s, row, c, appender) == DuckDBError)
                 return false;
-        }
         if (duckdb_appender_end_row(appender) == DuckDBError) return false;
     }
     return true;
-}
-
-/* ============================================================================
-   Deterministic Data Generation
-
-   Given (seq, col_index), every cell value is deterministic.
-   Used by producers to fill, and by verifiers to check.
-   ========================================================================= */
-
-static inline int32_t expected_int32(int64_t seq, int col) {
-    return (int32_t)((seq * 31 + col * 7) ^ 0xDEAD);
-}
-
-static inline int64_t expected_int64(int64_t seq, int col) {
-    return (seq * 1000003LL + col * 999983LL) ^ 0xCAFEBABE;
-}
-
-static inline double expected_double(int64_t seq, int col) {
-    return (double)(seq % 100000) * 0.001 + col * 1.1;
-}
-
-static inline int8_t expected_bool(int64_t seq, int col) {
-    return (int8_t)(((seq + col) % 3) == 0 ? 1 : 0);
-}
-
-static inline void expected_varchar(int64_t seq, int col, int cap, char *buf) {
-    if (!buf || cap <= 0) return;
-    snprintf(buf, (size_t)cap, "R%lldC%d_%llx",
-             (long long)seq, col,
-             (unsigned long long)(seq * 37 + col));
-}
-
-static inline uint32_t expected_uint32(int64_t seq, int col) {
-    return (uint32_t)((seq * 31 + col * 7) ^ 0xBEEF);
-}
-
-static inline uint64_t expected_uint64(int64_t seq, int col) {
-    return (uint64_t)((seq * 1000003ULL + col * 999983ULL) ^ 0xFACEULL);
-}
-
-static inline float expected_float(int64_t seq, int col) {
-    return (float)(seq % 10000) * 0.01f + col * 1.1f;
-}
-
-static inline double expected_decimal(int64_t seq, int col, uint8_t width,
-                                      uint8_t scale) {
-    /* Generate a deterministic value that fits in DECIMAL(width, scale).
-       Integer part has (width - scale) digits, fractional part has scale digits. */
-    int64_t int_digits = width - scale;
-    int64_t int_max = 1;
-    for (uint8_t i = 0; i < int_digits && i < 15; i++) int_max *= 10;
-    int_max--;
-    int64_t int_part = (int64_t)((seq * 31 + col * 7) % (int_max + 1));
-
-    double frac = 0.0;
-    if (scale > 0) {
-        int64_t frac_max = 1;
-        for (uint8_t i = 0; i < scale && i < 15; i++) frac_max *= 10;
-        int64_t frac_part = (int64_t)((seq * 13 + col * 3) % frac_max);
-        frac = (double)frac_part / (double)frac_max;
-    }
-    return (double)int_part + frac;
-}
-
-static inline void fill_row_deterministic(Batch *b, int row, int64_t seq,
-                                          const Schema *s) {
-    for (int c = 0; c < s->ncols; c++) {
-        switch (s->cols[c].type) {
-            case COL_INT32:
-                batch_set_int32(b, c, row, expected_int32(seq, c));
-                break;
-            case COL_INT64:
-                batch_set_int64(b, c, row, expected_int64(seq, c));
-                break;
-            case COL_DOUBLE:
-                batch_set_double(b, c, row, expected_double(seq, c));
-                break;
-            case COL_BOOL:
-                batch_set_bool(b, c, row, expected_bool(seq, c));
-                break;
-            case COL_VARCHAR:
-                expected_varchar(seq, c, s->cols[c].varchar_cap,
-                                 batch_get_varchar_mut(b, c, row));
-                break;
-            case COL_UINT32:
-                batch_set_uint32(b, c, row, expected_uint32(seq, c));
-                break;
-            case COL_UINT64:
-                batch_set_uint64(b, c, row, expected_uint64(seq, c));
-                break;
-            case COL_FLOAT:
-                batch_set_float(b, c, row, expected_float(seq, c));
-                break;
-            case COL_DECIMAL:
-                batch_set_decimal(b, c, row,
-                                 expected_decimal(seq, c, s->cols[c].decimal_width,
-                                                  s->cols[c].decimal_scale));
-                break;
-        }
-    }
 }

@@ -14,6 +14,7 @@
 // ============================================================================
 
 #include "duckdb_flow.h"
+#include "duckdb_flow_testutil.h"
 
 #include <pthread.h>
 #include <unistd.h>

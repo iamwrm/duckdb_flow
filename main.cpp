@@ -7,6 +7,7 @@
 // ============================================================================
 
 #include "duckdb_flow.h"
+#include "duckdb_flow_testutil.h"
 
 #include <pthread.h>
 #include <unistd.h>
@@ -81,7 +82,7 @@ static void *consumer_thread(void *arg) {
     bool appender_created = false;
     char *err = nullptr;
     char *drop_sql = nullptr;
-    char *ddl_sql = nullptr;
+    char ddl_sql[4096] = {0};
 
     bool failed = false;
 
@@ -116,15 +117,7 @@ static void *consumer_thread(void *arg) {
     }
 
     if (!failed) {
-        size_t ddl_cap = schema_create_ddl_required(s, ctx->table_name);
-        ddl_sql = static_cast<char *>(malloc(ddl_cap));
-        if (!ddl_sql) {
-            doublebuf_set_error(dbuf, "malloc failed for DDL");
-            failed = true;
-        } else {
-            schema_create_ddl(s, ctx->table_name, ddl_sql,
-                              static_cast<int>(ddl_cap));
-        }
+        schema_create_ddl(s, ctx->table_name, ddl_sql, sizeof(ddl_sql));
     }
 
     if (!failed) {
@@ -172,7 +165,6 @@ static void *consumer_thread(void *arg) {
 
     if (err) duckdb_free(err);
     free(drop_sql);
-    free(ddl_sql);
     if (con) duckdb_disconnect(&con);
     if (db) duckdb_close(&db);
     return nullptr;
