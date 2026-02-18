@@ -15,5 +15,11 @@ jobs:
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake build-essential
 
+      - name: Cache DuckDB download
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: duckdb-v1.4.0-${{ runner.os }}-${{ runner.arch }}
+
       - name: Build and test
         run: bash run.sh

@@ -37,15 +37,22 @@ echo "── Running Fuzz Tests (test_fuzz) ────────────
 "$BUILD/test_fuzz"
 TEST_RC=$?
 
+# ── Run UDF Benchmark ───────────────────────────────────────────
+echo ""
+echo "── Running UDF Benchmark (udf_bench) ───────────────────────"
+"$BUILD/udf_bench"
+UDF_RC=$?
+
 # ── Summary ─────────────────────────────────────────────────────
 echo ""
 echo "═══════════════════════════════════════════════════════════"
-if [ $MAIN_RC -eq 0 ] && [ $TEST_RC -eq 0 ]; then
-    echo "  ✅  All good — demo and fuzz tests passed"
+if [ $MAIN_RC -eq 0 ] && [ $TEST_RC -eq 0 ] && [ $UDF_RC -eq 0 ]; then
+    echo "  ✅  All good — demo, fuzz tests, and UDF benchmark passed"
 else
     echo "  ❌  Failures detected"
     [ $MAIN_RC -ne 0 ] && echo "       main exited $MAIN_RC"
     [ $TEST_RC -ne 0 ] && echo "       test_fuzz exited $TEST_RC"
+    [ $UDF_RC  -ne 0 ] && echo "       udf_bench exited $UDF_RC"
 fi
 echo "═══════════════════════════════════════════════════════════"
-exit $(( MAIN_RC | TEST_RC ))
+exit $(( MAIN_RC | TEST_RC | UDF_RC ))
