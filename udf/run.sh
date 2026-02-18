@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd "$(dirname "$0")"
-
-BUILD_DIR="build"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+BUILD="$ROOT/build"
 
 echo "── Configure ──"
-cmake -S . -B "$BUILD_DIR"
+cmake -S "$ROOT" -B "$BUILD"
 
 echo ""
 echo "── Build ──"
-cmake --build "$BUILD_DIR" -j"$(nproc)"
+cmake --build "$BUILD" --target udf_bench -j"$(nproc)"
 
 echo ""
 echo "── Run ──"
-"$BUILD_DIR/main"
+"$BUILD/udf_bench"
